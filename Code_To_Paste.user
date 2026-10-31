@@ -1,0 +1,299 @@
+// ==UserScript==
+// @name         YesOfficer BA Player Controls
+// @namespace    nk.yesofficerba.controls
+// @version      1.4
+// @description  Left/Right = -/+10s, M = mute toggle, hold Space = 2x, tap Space = play/pause. Messages show inside the video; controls hide 5s after pausing with Space.
+// @match        https://yesofficerba.vercel.app/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  var SEEK = 10;      // seconds for Left / Right arrow
+  var FAST = 2;       // speed while Space is held
+  var HOLD_MS = 250;  // hold Space longer than this = 2x, shorter = tap (play/pause)
+  var HIDE_AFTER_MS = 5000; // hide the video's control bar this long after pausing with Space
+
+  var spaceDown = false;
+  var fastActive = false;
+  var holdTimer = null;
+  var savedRate = 1;
+
+  function getVideo() {
+    var list = document.querySelectorAll('video');
+    if (!list.length) return null;
+    var vids = Array.prototype.slice.call(list);
+    for (var i = 0; i < vids.length; i++) {
+      if (!vids[i].paused && !vids[i].ended) return vids[i];
+    }
+    vids.sort(function (a, b) {
+      return (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight);
+    });
+    return vids[0];
+  }
+
+  function isTyping(e) {
+    var t = e.target;
+    if (!t) return false;
+    if (t.isContentEditable) return true;
+    var tags = ['INPUT', 'TEXTAREA', 'SELECT'];
+    return tags.indexOf(t.tagName) !== -1;
+  }
+
+  function isSpace(e) {
+    if (e.code === 'Space') return true;
+    if (e.key === ' ') return true;
+    return false;
+  }
+
+  // ---- Hide the video's own control bar while paused ----
+  var HIDE_CLASS = 'nk-hide-controls';
+  function addStyle() {
+    var st = document.createElement('style');
+    st.textContent =
+      'video.' + HIDE_CLASS + '::-webkit-media-controls{display:none !important;}' +
+      'video.' + HIDE_CLASS + '::-webkit-media-controls-enclosure{display:none !important;}' +
+      'video.' + HIDE_CLASS + '::-webkit-media-controls-panel{display:none !important;}';
+    var where = document.head ? document.head : document.documentElement;
+    where.appendChild(st);
+  }
+  if (document.documentElement) {
+    addStyle();
+  } else {
+    document.addEventListener('DOMContentLoaded', addStyle);
+  }
+
+  var hideTimer = null;
+  var hideVideo = null;
+  var hideActive = false; // true only after pausing with Space
+
+  function showBar() {
+    clearTimeout(hideTimer);
+    var all = document.querySelectorAll('video');
+    for (var i = 0; i < all.length; i++) {
+      all[i].classList.remove(HIDE_CLASS);
+    }
+  }
+
+  // Show the bar now; if the video is paused, hide it again after a few seconds
+  function armHide(v) {
+    showBar();
+    if (!v) return;
+    if (!v.paused) return;
+    hideActive = true;
+    hideVideo = v;
+    hideTimer = setTimeout(function () {
+      if (hideVideo) {
+        if (hideVideo.paused) hideVideo.classList.add(HIDE_CLASS);
+      }
+    }, HIDE_AFTER_MS);
+  }
+
+  // Any mouse or touch activity brings the bar back (and re-arms the timer while paused)
+  function onActivity() {
+    var v = getVideo();
+    if (!v) return;
+    if (hideActive) {
+      if (v.paused) armHide(v);
+    }
+  }
+  window.addEventListener('mousemove', onActivity, true);
+  window.addEventListener('mousedown', onActivity, true);
+  window.addEventListener('touchstart', onActivity, true);
+
+  // Playing again always shows the normal controls behaviour
+  document.addEventListener('play', function () { hideActive = false; showBar(); }, true);
+  document.addEventListener('ended', function () { hideActive = false; showBar(); }, true);
+
+  // Drop keyboard focus from the video's built-in controls so the control bar
+  // can fade out again by itself (it stays visible while a control has focus).
+  function releaseFocus(v) {
+    try {
+      var a = document.activeElement;
+      if (!a) return;
+      if (a === v) {
+        v.blur();
+      } else if (a.tagName === 'VIDEO') {
+        a.blur();
+      }
+    } catch (err) {}
+  }
+
+  // ---- Message shown inside the video ----
+  // In full screen the message must live inside the full-screen element,
+  // otherwise the browser hides it.
+  function host() {
+    var f = document.fullscreenElement;
+    if (f) {
+      if (f.tagName !== 'VIDEO') return f;
+    }
+    return document.body;
+  }
+
+  var toastEl = null;
+  var toastTimer = null;
+  var toastHideTimer = null;
+  var usePopover = false;
+
+  function makeToast() {
+    toastEl = document.createElement('div');
+    toastEl.style.cssText =
+      'position:fixed;inset:auto;margin:0;border:0;overflow:visible;width:auto;height:auto;' +
+      'transform:translateX(-50%);z-index:2147483647;' +
+      'background:rgba(0,0,0,.75);color:#fff;padding:6px 14px;border-radius:6px;' +
+      'font:15px sans-serif;opacity:0;transition:opacity .2s;pointer-events:none;';
+    if (typeof toastEl.showPopover === 'function') {
+      // A "popover" is drawn in the browser's top layer, which sits above
+      // a full-screen video too.
+      toastEl.setAttribute('popover', 'manual');
+      usePopover = true;
+    }
+  }
+
+  function toast(msg) {
+    if (!document.body) return;
+    if (!toastEl) makeToast();
+
+    if (usePopover) {
+      if (toastEl.parentNode !== document.body) document.body.appendChild(toastEl);
+    } else {
+      var h = host();
+      if (toastEl.parentNode !== h) h.appendChild(toastEl);
+    }
+
+    // Place it at the top centre of the video; if there is no video, top of the page
+    var v = getVideo();
+    var left = window.innerWidth / 2;
+    var top = 20;
+    if (v) {
+      var r = v.getBoundingClientRect();
+      left = r.left + r.width / 2;
+      top = Math.max(r.top, 0) + 16;
+    }
+    toastEl.style.left = left + 'px';
+    toastEl.style.top = top + 'px';
+
+    toastEl.textContent = msg;
+    toastEl.style.opacity = '1';
+
+    if (usePopover) {
+      // Hide then show again so it goes to the very front of the top layer
+      try { toastEl.hidePopover(); } catch (e1) {}
+      try { toastEl.showPopover(); } catch (e2) {}
+    }
+
+    clearTimeout(toastTimer);
+    clearTimeout(toastHideTimer);
+    toastTimer = setTimeout(function () {
+      toastEl.style.opacity = '0';
+      if (usePopover) {
+        toastHideTimer = setTimeout(function () {
+          try { toastEl.hidePopover(); } catch (e3) {}
+        }, 300);
+      }
+    }, 700);
+  }
+
+  function endFast() {
+    clearTimeout(holdTimer);
+    if (fastActive) {
+      var v = getVideo();
+      if (v) {
+        v.playbackRate = savedRate;
+        releaseFocus(v);
+      }
+      toast('1x');
+    }
+    fastActive = false;
+    spaceDown = false;
+  }
+
+  // Keep 2x if the site tries to reset the speed while Space is held
+  window.addEventListener('ratechange', function (e) {
+    if (!fastActive) return;
+    if (!(e.target instanceof HTMLMediaElement)) return;
+    if (e.target.playbackRate !== FAST) e.target.playbackRate = FAST;
+  }, true);
+
+  window.addEventListener('keydown', function (e) {
+    if (isTyping(e)) return;
+    if (e.ctrlKey) return;
+    if (e.metaKey) return;
+    if (e.altKey) return;
+
+    if (isSpace(e)) {
+      // Always block the site's own Space handling; we do play/pause ourselves on release
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (spaceDown) return; // ignore auto-repeat while held
+      spaceDown = true;
+      fastActive = false;
+      holdTimer = setTimeout(function () {
+        var v = getVideo();
+        if (!v) return;
+        if (!spaceDown) return;
+        fastActive = true;
+        savedRate = v.playbackRate;
+        v.playbackRate = FAST;
+        toast('2x');
+      }, HOLD_MS);
+      return;
+    }
+
+    var v2 = getVideo();
+    if (!v2) return;
+
+    var isArrow = false;
+    if (e.key === 'ArrowRight') isArrow = true;
+    if (e.key === 'ArrowLeft') isArrow = true;
+
+    if (isArrow) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      var d = e.key === 'ArrowRight' ? SEEK : -SEEK;
+      var dur = v2.duration > 0 ? v2.duration : Infinity;
+      v2.currentTime = Math.max(0, Math.min(dur, v2.currentTime + d));
+      toast((d > 0 ? '+' : '') + d + 's');
+      releaseFocus(v2);
+      if (v2.paused) armHide(v2);
+    } else if (e.key && e.key.toLowerCase() === 'm' && !e.repeat) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      v2.muted = !v2.muted;
+      toast(v2.muted ? 'Muted' : 'Unmuted');
+      releaseFocus(v2);
+      if (v2.paused) armHide(v2);
+    }
+  }, true);
+
+  window.addEventListener('keyup', function (e) {
+    if (!isSpace(e)) return;
+    if (!spaceDown) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    var wasFast = fastActive;
+    endFast();
+    if (!wasFast) {
+      // Quick tap: toggle play/pause
+      var v = getVideo();
+      if (v) {
+        if (v.paused) {
+          showBar();
+          var p = v.play();
+          if (p) {
+            if (p.catch) p.catch(function () {});
+          }
+        } else {
+          v.pause();
+          armHide(v);
+        }
+        releaseFocus(v);
+      }
+    }
+  }, true);
+
+  // If the window loses focus while Space is held, don't get stuck at 2x
+  window.addEventListener('blur', endFast);
+})();
