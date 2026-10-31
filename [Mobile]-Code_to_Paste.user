@@ -1,0 +1,264 @@
+// ==UserScript==
+// @name         YesOfficer BA Mobile Touch Controls v6
+// @namespace    nk.yesofficerba.mobile
+// @version      6.0
+// @description  Touch: tap = play/pause, double-tap left/right = -/+10s, hold = 2x. Messages show inside the video, also in full screen.
+// @match        https://yesofficerba.vercel.app/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  var SEEK = 10;
+  var FAST = 2;
+  var LONG_MS = 350;
+  var DOUBLE_MS = 300;
+  var MOVE_PX = 12;
+
+  // Bottom strip of the video is never touched, so the video's own controls work there
+  var CONTROL_ZONE = 0.18;
+  var ZONE_MIN_PX = 72;
+  var ZONE_MAX = 0.4;
+
+  var IGNORE = 'button, a, input, select, textarea, [role="button"], [role="slider"]';
+
+  var g = null;
+  var lastTap = 0;
+  var singleTimer = null;
+  var fastActive = false;
+  var savedRate = 1;
+
+  // What the script did last (shown only if the video reports an error)
+  var lastAction = 'nothing yet';
+  var lastActionAt = 0;
+  function note(what) {
+    lastAction = what;
+    lastActionAt = Date.now();
+  }
+
+  function host() {
+    var f = document.fullscreenElement;
+    if (f) {
+      if (f.tagName !== 'VIDEO') return f;
+    }
+    return document.body;
+  }
+
+  var toastEl = null;
+  var toastTimer = null;
+  var toastHideTimer = null;
+  var usePopover = false;
+
+  function makeToast() {
+    toastEl = document.createElement('div');
+    toastEl.style.cssText =
+      'position:fixed;inset:auto;margin:0;border:0;overflow:visible;width:auto;height:auto;' +
+      'transform:translateX(-50%);z-index:2147483647;' +
+      'background:rgba(0,0,0,.75);color:#fff;padding:8px 16px;border-radius:8px;' +
+      'font:16px sans-serif;opacity:0;transition:opacity .15s;pointer-events:none;' +
+      'max-width:90%;text-align:center;';
+    if (typeof toastEl.showPopover === 'function') {
+      // A popover is drawn in the browser's top layer, above a full-screen video too
+      toastEl.setAttribute('popover', 'manual');
+      usePopover = true;
+    }
+  }
+
+  // v = the video the message belongs to (the message is placed at its top centre)
+  function toast(msg, ms, v) {
+    if (!document.body) return;
+    if (!toastEl) makeToast();
+
+    if (usePopover) {
+      if (toastEl.parentNode !== document.body) document.body.appendChild(toastEl);
+    } else {
+      var h = host();
+      if (toastEl.parentNode !== h) h.appendChild(toastEl);
+    }
+
+    var left = window.innerWidth / 2;
+    var top = 24;
+    if (v) {
+      var r = v.getBoundingClientRect();
+      var vl = Math.max(r.left, 0);
+      var vr = Math.min(r.right, window.innerWidth);
+      left = (vl + vr) / 2;
+      top = Math.max(r.top, 0) + 16;
+    }
+    toastEl.style.left = left + 'px';
+    toastEl.style.top = top + 'px';
+
+    toastEl.textContent = msg;
+    toastEl.style.opacity = '1';
+
+    if (usePopover) {
+      // Hide then show again so it goes to the very front of the top layer
+      try { toastEl.hidePopover(); } catch (e1) {}
+      try { toastEl.showPopover(); } catch (e2) {}
+    }
+
+    clearTimeout(toastTimer);
+    clearTimeout(toastHideTimer);
+    var life = ms ? ms : 700;
+    toastTimer = setTimeout(function () {
+      toastEl.style.opacity = '0';
+      if (usePopover) {
+        toastHideTimer = setTimeout(function () {
+          try { toastEl.hidePopover(); } catch (e3) {}
+        }, 300);
+      }
+    }, life);
+  }
+
+  // If the video ever reports an error, show its code and what this script did just before
+  document.addEventListener('error', function (e) {
+    var t = e.target;
+    if (!(t instanceof HTMLMediaElement)) return;
+    var er = t.error;
+    var code = er ? er.code : '?';
+    var msg = er ? er.message : '';
+    var what = 'script did nothing yet (no gesture used)';
+    if (lastActionAt > 0) {
+      var ago = Math.round((Date.now() - lastActionAt) / 1000);
+      what = 'last script action: ' + lastAction + ', ' + ago + 's before';
+    }
+    toast('Video error ' + code + (msg ? ' (' + msg + ')' : '') + ' - ' + what, 12000, t);
+  }, true);
+
+  function videoAt(x, y) {
+    var vids = document.querySelectorAll('video');
+    for (var i = 0; i < vids.length; i++) {
+      var v = vids[i];
+      var r = v.getBoundingClientRect();
+      if (r.width < 50) continue;
+      if (r.height < 50) continue;
+      if (x < r.left) continue;
+      if (x > r.right) continue;
+      if (y < r.top) continue;
+      if (y > r.bottom) continue;
+      return { v: v, r: r };
+    }
+    return null;
+  }
+
+  function zoneHeight(r) {
+    var z = Math.max(r.height * CONTROL_ZONE, ZONE_MIN_PX);
+    return Math.min(z, r.height * ZONE_MAX);
+  }
+
+  function seek(v, delta) {
+    note('double-tap seek ' + delta + 's');
+    var dur = v.duration > 0 ? v.duration : Infinity;
+    v.currentTime = Math.max(0, Math.min(dur, v.currentTime + delta));
+    toast(delta > 0 ? '⏩ +' + SEEK + 's' : '⏪ -' + SEEK + 's', 0, v);
+  }
+
+  function togglePlay(v) {
+    if (v.paused) {
+      note('tap play');
+      var p = v.play();
+      if (p) {
+        if (p.catch) p.catch(function () {});
+      }
+    } else {
+      note('tap pause');
+      v.pause();
+    }
+  }
+
+  function endFast(v) {
+    if (fastActive) {
+      note('hold 2x end');
+      if (v) v.playbackRate = savedRate;
+    }
+    fastActive = false;
+  }
+
+  document.addEventListener('ratechange', function (e) {
+    if (!fastActive) return;
+    if (!(e.target instanceof HTMLMediaElement)) return;
+    if (e.target.playbackRate !== FAST) e.target.playbackRate = FAST;
+  }, true);
+
+  document.addEventListener('touchstart', function (e) {
+    g = null;
+    if (e.touches.length !== 1) return;
+    if (e.target.closest) {
+      if (e.target.closest(IGNORE)) return;
+    }
+    var t = e.touches[0];
+    var hit = videoAt(t.clientX, t.clientY);
+    if (!hit) return;
+    if (t.clientY > hit.r.bottom - zoneHeight(hit.r)) return;
+
+    var cur = { x: t.clientX, y: t.clientY, v: hit.v, r: hit.r, moved: false, long: false, timer: null };
+    cur.timer = setTimeout(function () {
+      if (g !== cur) return;
+      if (cur.moved) return;
+      cur.long = true;
+      fastActive = true;
+      note('hold 2x start');
+      savedRate = cur.v.playbackRate;
+      cur.v.playbackRate = FAST;
+      toast('2x ▶▶', 0, cur.v);
+      if (navigator.vibrate) navigator.vibrate(15);
+    }, LONG_MS);
+    g = cur;
+  }, { capture: true, passive: true });
+
+  document.addEventListener('touchmove', function (e) {
+    if (!g) return;
+    if (g.long) return;
+    var t = e.touches[0];
+    var dx = Math.abs(t.clientX - g.x);
+    var dy = Math.abs(t.clientY - g.y);
+    if (Math.max(dx, dy) > MOVE_PX) {
+      g.moved = true;
+      clearTimeout(g.timer);
+    }
+  }, { capture: true, passive: true });
+
+  document.addEventListener('touchend', function (e) {
+    if (!g) return;
+    var cur = g;
+    g = null;
+    clearTimeout(cur.timer);
+
+    if (cur.long) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      endFast(cur.v);
+      return;
+    }
+    if (cur.moved) return;
+
+    e.preventDefault();
+    e.stopImmediatePropagation();
+
+    var now = Date.now();
+    if (now - lastTap < DOUBLE_MS) {
+      clearTimeout(singleTimer);
+      var forward = cur.x > cur.r.left + cur.r.width / 2;
+      seek(cur.v, forward ? SEEK : -SEEK);
+    } else {
+      clearTimeout(singleTimer);
+      singleTimer = setTimeout(function () { togglePlay(cur.v); }, DOUBLE_MS);
+    }
+    lastTap = now;
+  }, { capture: true, passive: false });
+
+  document.addEventListener('touchcancel', function () {
+    if (g) {
+      clearTimeout(g.timer);
+      if (g.long) endFast(g.v);
+    }
+    g = null;
+  }, true);
+
+  document.addEventListener('contextmenu', function (e) {
+    if (g) e.preventDefault();
+    if (fastActive) e.preventDefault();
+  }, true);
+})();
