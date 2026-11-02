@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YesOfficer BA Player Controls
 // @namespace    nk.yesofficerba.controls
-// @version      1.6
-// @description  Left/Right = -/+10s, M = mute toggle, hold Space = 2x, tap Space = play/pause, Shift+Up / Shift+Down = speed 1x-3x, Up / Down = volume. Messages show inside the video; controls hide 5s after pausing with Space.
+// @version      1.7
+// @description  Left/Right = -/+10s, M = mute toggle, hold Space = 2x, tap Space = play/pause, Shift+Up / Shift+Down = speed 1x-3x, Up / Down = volume, hover the timeline = preview picture. Messages show inside the video; controls hide 5s after pausing with Space.
 // @match        https://yesofficerba.vercel.app/*
 // @grant        none
 // @run-at       document-start
@@ -20,6 +20,14 @@
   // false: Up / Down always change the volume (they no longer scroll the page).
   // true: only when the mouse is over the video or the video is full screen; elsewhere they scroll as normal.
   var VOLUME_ONLY_OVER_VIDEO = false;
+
+  // Preview picture shown above the timeline when you hover it
+  var PREVIEW_ENABLED = true;  // set to false to switch the preview off completely
+  var PREVIEW_W = 176;         // width of the preview picture in pixels
+  var PREVIEW_QUALITY = 240;   // quality tried for the preview (0 = same quality as the video)
+  var SIDE_PAD = 30;           // the timeline starts / ends this far from the video's left / right edge
+  var BAND_MIN = 18;           // hover zone: from this many px above the video's bottom edge ...
+  var BAND_MAX = 46;           // ... up to this many px above it (this is the timeline row)
 
   var spaceDown = false;
   var fastActive = false;
@@ -201,6 +209,269 @@
       }
     }, 700);
   }
+
+  // ---- Preview picture when hovering the timeline ----
+  // A hidden second copy of the video jumps to the time under the mouse and its
+  // frame is drawn in a small box above the timeline. The video's own player is
+  // not touched, and nothing is loaded until you first hover the timeline.
+  var pvEl = null;
+  var pvCanvas = null;
+  var pvLabel = null;
+  var pvCtx = null;
+  var pvVideo = null;
+  var pvSrc = '';
+  var pvLow = false;
+  var pvFailed = false;
+  var pvBusy = false;
+  var pvBusyTimer = null;
+  var pvPending = -1;
+  var pvIdle = null;
+  var pvPopover = false;
+
+  function fmt(sec) {
+    if (!(sec > 0)) sec = 0;
+    sec = Math.floor(sec);
+    var h = Math.floor(sec / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    var x = sec % 60;
+    var ss = (x < 10 ? '0' : '') + x;
+    if (h > 0) return h + ':' + (m < 10 ? '0' : '') + m + ':' + ss;
+    return m + ':' + ss;
+  }
+
+  // The same address with a lower quality number, if the address has one
+  function lowQualityUrl(src) {
+    if (!PREVIEW_QUALITY) return src;
+    try {
+      var u = new URL(src);
+      var inner = u.searchParams.get('url');
+      if (!inner) return src;
+      var changed = inner.replace(/([?&]bitrate=)\d+/, '$1' + PREVIEW_QUALITY);
+      if (changed === inner) return src;
+      u.searchParams.set('url', changed);
+      return u.toString();
+    } catch (err) {
+      return src;
+    }
+  }
+
+  function drawPreview() {
+    if (!pvVideo) return;
+    if (!pvCtx) return;
+    try {
+      pvCtx.drawImage(pvVideo, 0, 0, pvCanvas.width, pvCanvas.height);
+    } catch (err) {}
+  }
+
+  function seekPreview(t) {
+    if (!pvVideo) return;
+    if (pvVideo.readyState < 1) {
+      pvPending = t;
+      return;
+    }
+    if (pvVideo.duration > 0) {
+      if (isFinite(pvVideo.duration)) t = Math.min(t, pvVideo.duration - 0.2);
+    }
+    if (t < 0) t = 0;
+    if (Math.abs(pvVideo.currentTime - t) < 0.05) {
+      drawPreview();
+      return;
+    }
+    if (pvBusy) {
+      pvPending = t;
+      return;
+    }
+    pvBusy = true;
+    pvPending = -1;
+    clearTimeout(pvBusyTimer);
+    pvBusyTimer = setTimeout(function () { pvBusy = false; }, 2500);
+    try {
+      if (typeof pvVideo.fastSeek === 'function') {
+        pvVideo.fastSeek(t);
+      } else {
+        pvVideo.currentTime = t;
+      }
+    } catch (err) {
+      pvBusy = false;
+    }
+  }
+
+  function makePvVideo(url) {
+    if (pvVideo) {
+      pvVideo.removeAttribute('src');
+      try { pvVideo.load(); } catch (e0) {}
+    }
+    var el = document.createElement('video');
+    pvVideo = el;
+    el.muted = true;
+    el.preload = 'metadata';
+    el.setAttribute('playsinline', '');
+    el.addEventListener('loadedmetadata', function () {
+      if (el !== pvVideo) return;
+      if (pvPending >= 0) seekPreview(pvPending);
+    });
+    el.addEventListener('seeked', function () {
+      if (el !== pvVideo) return;
+      pvBusy = false;
+      clearTimeout(pvBusyTimer);
+      drawPreview();
+      if (pvPending >= 0) {
+        var t = pvPending;
+        pvPending = -1;
+        seekPreview(t);
+      }
+    });
+    el.addEventListener('error', function () {
+      if (el !== pvVideo) return;
+      pvBusy = false;
+      if (pvLow) {
+        // the lower-quality address did not work: use the normal one instead
+        pvLow = false;
+        makePvVideo(pvSrc);
+      } else {
+        pvFailed = true;
+        hidePreview();
+      }
+    });
+    el.src = url;
+  }
+
+  // Make sure the hidden copy exists for the video's current address
+  function ensurePreview(v) {
+    var src = v.currentSrc;
+    if (!src) return false;
+    if (src.indexOf('blob:') === 0) return false;   // a stream that cannot be copied
+    if (pvVideo) {
+      if (pvSrc === src) return !pvFailed;
+    }
+    pvSrc = src;
+    pvFailed = false;
+    pvPending = -1;
+    pvBusy = false;
+    var low = lowQualityUrl(src);
+    pvLow = low !== src;
+    makePvVideo(low);
+    return true;
+  }
+
+  function buildPreviewBox() {
+    pvEl = document.createElement('div');
+    pvEl.style.cssText =
+      'position:fixed;inset:auto;margin:0;border:0;overflow:visible;width:auto;height:auto;' +
+      'z-index:2147483647;pointer-events:none;background:#000;padding:3px;border-radius:6px;' +
+      'box-shadow:0 2px 10px rgba(0,0,0,.6);color:#fff;font:13px sans-serif;text-align:center;';
+    pvCanvas = document.createElement('canvas');
+    pvCanvas.style.cssText = 'display:block;border-radius:4px;';
+    pvLabel = document.createElement('div');
+    pvLabel.style.cssText = 'margin-top:2px;height:17px;line-height:17px;';
+    pvEl.appendChild(pvCanvas);
+    pvEl.appendChild(pvLabel);
+    pvCtx = pvCanvas.getContext('2d');
+    if (typeof pvEl.showPopover === 'function') {
+      pvEl.setAttribute('popover', 'manual');
+      pvPopover = true;
+    }
+  }
+
+  function showPreviewAt(v, r, x, t) {
+    if (!document.body) return;
+    if (!pvEl) buildPreviewBox();
+    var ar = v.videoWidth > 0 ? v.videoHeight / v.videoWidth : 9 / 16;
+    var w = PREVIEW_W;
+    var h = Math.round(w * ar);
+    if (pvCanvas.width !== w) pvCanvas.width = w;
+    if (pvCanvas.height !== h) pvCanvas.height = h;
+    pvCanvas.style.width = w + 'px';
+    pvCanvas.style.height = h + 'px';
+    pvLabel.textContent = fmt(t);
+    var boxW = w + 6;
+    var boxH = h + 6 + 19;
+    var left = x - boxW / 2;
+    left = Math.max(r.left + 4, Math.min(left, r.right - boxW - 4));
+    var top = r.bottom - BAND_MAX - 8 - boxH;
+    top = Math.max(top, Math.max(r.top, 0) + 4);
+    pvEl.style.left = left + 'px';
+    pvEl.style.top = top + 'px';
+    if (pvPopover) {
+      // it must be part of the page before it can be shown as a popover
+      if (pvEl.parentNode !== document.body) document.body.appendChild(pvEl);
+      var isOpen = false;
+      try { isOpen = pvEl.matches(':popover-open'); } catch (e1) {}
+      if (!isOpen) {
+        try { pvEl.showPopover(); } catch (e2) {}
+      }
+    } else {
+      var hst = host();
+      if (pvEl.parentNode !== hst) hst.appendChild(pvEl);
+      pvEl.style.display = 'block';
+    }
+  }
+
+  function hidePreview() {
+    clearTimeout(pvIdle);
+    pvPending = -1;
+    if (!pvEl) return;
+    if (pvPopover) {
+      try { pvEl.hidePopover(); } catch (err) {}
+    } else {
+      pvEl.style.display = 'none';
+    }
+  }
+
+  function onHover(e) {
+    if (!PREVIEW_ENABLED) return;
+    var v = getVideo();
+    if (!v) {
+      hidePreview();
+      return;
+    }
+    var r = v.getBoundingClientRect();
+    var fromBottom = r.bottom - e.clientY;
+    var inside = true;
+    if (e.clientX < r.left) inside = false;
+    if (e.clientX > r.right) inside = false;
+    if (fromBottom < BAND_MIN) inside = false;
+    if (fromBottom > BAND_MAX) inside = false;
+    if (!inside) {
+      hidePreview();
+      return;
+    }
+    if (v.classList.contains(HIDE_CLASS)) {   // the control bar is hidden right now
+      hidePreview();
+      return;
+    }
+    if (!(v.duration > 0)) return;
+    if (!isFinite(v.duration)) return;
+    if (!ensurePreview(v)) return;
+    if (pvFailed) return;
+
+    var f = (e.clientX - (r.left + SIDE_PAD)) / (r.width - 2 * SIDE_PAD);
+    if (f < 0) f = 0;
+    if (f > 1) f = 1;
+    var t = f * v.duration;
+    seekPreview(t);
+    showPreviewAt(v, r, e.clientX, t);
+
+    // the video's own control bar fades after a while, so does the preview
+    clearTimeout(pvIdle);
+    pvIdle = setTimeout(hidePreview, 2500);
+  }
+  window.addEventListener('mousemove', onHover, { capture: true, passive: true });
+  document.addEventListener('mouseleave', hidePreview);
+  document.addEventListener('mouseout', function (e) {
+    if (!e.relatedTarget) hidePreview();
+  }, true);
+  // Entering or leaving full screen: put the preview back in front
+  document.addEventListener('fullscreenchange', function () {
+    if (!pvEl) return;
+    if (!pvPopover) return;
+    var isOpen = false;
+    try { isOpen = pvEl.matches(':popover-open'); } catch (e1) {}
+    if (isOpen) {
+      try { pvEl.hidePopover(); } catch (e2) {}
+      try { pvEl.showPopover(); } catch (e3) {}
+    }
+  });
 
   function endFast() {
     clearTimeout(holdTimer);
