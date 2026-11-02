@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YesOfficer BA Player Controls
 // @namespace    nk.yesofficerba.controls
-// @version      1.4
-// @description  Left/Right = -/+10s, M = mute toggle, hold Space = 2x, tap Space = play/pause. Messages show inside the video; controls hide 5s after pausing with Space.
+// @version      1.6
+// @description  Left/Right = -/+10s, M = mute toggle, hold Space = 2x, tap Space = play/pause, Shift+Up / Shift+Down = speed 1x-3x, Up / Down = volume. Messages show inside the video; controls hide 5s after pausing with Space.
 // @match        https://yesofficerba.vercel.app/*
 // @grant        none
 // @run-at       document-start
@@ -15,11 +15,17 @@
   var FAST = 2;       // speed while Space is held
   var HOLD_MS = 250;  // hold Space longer than this = 2x, shorter = tap (play/pause)
   var HIDE_AFTER_MS = 5000; // hide the video's control bar this long after pausing with Space
+  var SPEEDS = [1, 1.5, 2, 2.5, 3]; // Shift+Up / Shift+Down steps (1x = normal, 3x = maximum)
+  var VOL_STEP = 0.1;               // Up / Down arrow change the volume by this much (0.1 = 10%)
+  // false: Up / Down always change the volume (they no longer scroll the page).
+  // true: only when the mouse is over the video or the video is full screen; elsewhere they scroll as normal.
+  var VOLUME_ONLY_OVER_VIDEO = false;
 
   var spaceDown = false;
   var fastActive = false;
   var holdTimer = null;
   var savedRate = 1;
+  var holdRate = FAST;
 
   function getVideo() {
     var list = document.querySelectorAll('video');
@@ -204,7 +210,7 @@
         v.playbackRate = savedRate;
         releaseFocus(v);
       }
-      toast('1x');
+      toast(savedRate + 'x');
     }
     fastActive = false;
     spaceDown = false;
@@ -214,8 +220,66 @@
   window.addEventListener('ratechange', function (e) {
     if (!fastActive) return;
     if (!(e.target instanceof HTMLMediaElement)) return;
-    if (e.target.playbackRate !== FAST) e.target.playbackRate = FAST;
+    if (e.target.playbackRate !== holdRate) e.target.playbackRate = holdRate;
   }, true);
+
+  // Remember where the mouse is (used only when VOLUME_ONLY_OVER_VIDEO is true)
+  var mouseX = -1;
+  var mouseY = -1;
+  window.addEventListener('mousemove', function (e) {
+    mouseX = e.clientX;
+    mouseY = e.clientY;
+  }, { capture: true, passive: true });
+
+  function mouseOverVideo(v) {
+    if (document.fullscreenElement) return true;
+    var r = v.getBoundingClientRect();
+    if (mouseX < r.left) return false;
+    if (mouseX > r.right) return false;
+    if (mouseY < r.top) return false;
+    if (mouseY > r.bottom) return false;
+    return true;
+  }
+
+  // Volume up (dir = 1) or down (dir = -1) in fixed steps, between 0% and 100%
+  function changeVolume(v, dir) {
+    var cur = v.volume;
+    var next = Math.round((cur + dir * VOL_STEP) * 100) / 100;
+    if (next > 1) next = 1;
+    if (next < 0) next = 0;
+    if (dir > 0 && v.muted) v.muted = false;
+    v.volume = next;
+    var label = 'Volume ' + Math.round(next * 100) + '%';
+    if (next === cur) label = label + (dir > 0 ? ' (max)' : ' (min)');
+    if (v.muted) label = label + ' (muted)';
+    toast(label);
+  }
+
+  // Move to the next speed step up (dir = 1) or down (dir = -1)
+  function changeSpeed(v, dir) {
+    var cur = fastActive ? savedRate : v.playbackRate;
+    var next = cur;
+    var i;
+    if (dir > 0) {
+      next = SPEEDS[SPEEDS.length - 1];
+      for (i = 0; i < SPEEDS.length; i++) {
+        if (SPEEDS[i] > cur + 0.001) { next = SPEEDS[i]; break; }
+      }
+    } else {
+      next = SPEEDS[0];
+      for (i = SPEEDS.length - 1; i >= 0; i--) {
+        if (SPEEDS[i] < cur - 0.001) { next = SPEEDS[i]; break; }
+      }
+    }
+    if (fastActive) {
+      savedRate = next;   // applied when Space is released
+    } else {
+      v.playbackRate = next;
+    }
+    var label = next + 'x';
+    if (next === cur) label = dir > 0 ? next + 'x (max)' : next + 'x (normal)';
+    toast(label);
+  }
 
   window.addEventListener('keydown', function (e) {
     if (isTyping(e)) return;
@@ -236,14 +300,49 @@
         if (!spaceDown) return;
         fastActive = true;
         savedRate = v.playbackRate;
-        v.playbackRate = FAST;
-        toast('2x');
+        holdRate = Math.max(FAST, savedRate);
+        v.playbackRate = holdRate;
+        toast(holdRate + 'x');
       }, HOLD_MS);
       return;
     }
 
     var v2 = getVideo();
     if (!v2) return;
+
+    // Shift + Up / Shift + Down = speed steps
+    var isSpeedKey = false;
+    if (e.shiftKey) {
+      if (e.key === 'ArrowUp') isSpeedKey = true;
+      if (e.key === 'ArrowDown') isSpeedKey = true;
+    }
+    if (isSpeedKey) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (e.repeat) return; // one step per key press
+      changeSpeed(v2, e.key === 'ArrowUp' ? 1 : -1);
+      releaseFocus(v2);
+      if (v2.paused) armHide(v2);
+      return;
+    }
+
+    // Up / Down (without Shift) = volume
+    var isVolKey = false;
+    if (!e.shiftKey) {
+      if (e.key === 'ArrowUp') isVolKey = true;
+      if (e.key === 'ArrowDown') isVolKey = true;
+    }
+    if (isVolKey) {
+      if (VOLUME_ONLY_OVER_VIDEO) {
+        if (!mouseOverVideo(v2)) return;
+      }
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      changeVolume(v2, e.key === 'ArrowUp' ? 1 : -1);
+      releaseFocus(v2);
+      if (v2.paused) armHide(v2);
+      return;
+    }
 
     var isArrow = false;
     if (e.key === 'ArrowRight') isArrow = true;
