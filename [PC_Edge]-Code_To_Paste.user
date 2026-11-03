@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YesOfficer BA Player Controls
 // @namespace    nk.yesofficerba.controls
-// @version      1.7
-// @description  Left/Right = -/+10s, M = mute toggle, hold Space = 2x, tap Space = play/pause, Shift+Up / Shift+Down = speed 1x-3x, Up / Down = volume, hover the timeline = preview picture. Messages show inside the video; controls hide 5s after pausing with Space.
+// @version      1.8
+// @description  Left/Right = -/+10s, M = mute toggle, hold Space = 2x, tap Space = play/pause, Shift+Up / Shift+Down = speed 1x-3x, Up / Down = volume, hover the timeline = preview picture (learns the timeline position from your clicks). Messages show inside the video; controls hide 5s after pausing with Space.
 // @match        https://yesofficerba.vercel.app/*
 // @grant        none
 // @run-at       document-start
@@ -28,6 +28,9 @@
   var SIDE_PAD = 30;           // the timeline starts / ends this far from the video's left / right edge
   var BAND_MIN = 18;           // hover zone: from this many px above the video's bottom edge ...
   var BAND_MAX = 46;           // ... up to this many px above it (this is the timeline row)
+  // true: after you click the timeline, a short note shows the preview time and the time you landed on.
+  // The script uses your clicks to learn where the timeline really is, so the preview gets more exact.
+  var PREVIEW_DEBUG = true;
 
   var spaceDown = false;
   var fastActive = false;
@@ -166,7 +169,7 @@
     }
   }
 
-  function toast(msg) {
+  function toast(msg, ms) {
     if (!document.body) return;
     if (!toastEl) makeToast();
 
@@ -207,7 +210,7 @@
           try { toastEl.hidePopover(); } catch (e3) {}
         }, 300);
       }
-    }, 700);
+    }, ms ? ms : 700);
   }
 
   // ---- Preview picture when hovering the timeline ----
@@ -418,6 +421,138 @@
     }
   }
 
+  // ---- Learning where the timeline really is, from your own clicks ----
+  // A click on the timeline tells us exactly which time belongs to which pixel.
+  // The result is remembered per video width (also after reloading the page).
+  var CAL_KEY = 'nk-yesofficer-timeline-cal';
+  var calStore = {};
+  try {
+    var savedCal = window.localStorage.getItem(CAL_KEY);
+    if (savedCal) calStore = JSON.parse(savedCal);
+  } catch (errLoad) {
+    calStore = {};
+  }
+  if (!calStore) calStore = {};
+  var calSamples = {};
+  
+  function saveCal() {
+    try {
+      window.localStorage.setItem(CAL_KEY, JSON.stringify(calStore));
+    } catch (errSave) {}
+  }
+
+  // How far the timeline's start and end are from the video's left and right edge
+  function insetsFor(width) {
+    var c = calStore[String(Math.round(width))];
+    if (c) return c;
+    return { a: SIDE_PAD, b: SIDE_PAD };
+  }
+
+  function refit(width) {
+    var key = String(Math.round(width));
+    var list = calSamples[key];
+    if (!list) return false;
+    var n = list.length;
+    if (n < 1) return false;
+    var sx = 0;
+    var sf = 0;
+    var minF = 1;
+    var maxF = 0;
+    var i;
+    for (i = 0; i < n; i++) {
+      sx += list[i].x;
+      sf += list[i].f;
+      if (list[i].f < minF) minF = list[i].f;
+      if (list[i].f > maxF) maxF = list[i].f;
+    }
+    var mx = sx / n;
+    var mf = sf / n;
+    var a;
+    var b;
+    if (n >= 2 && (maxF - minF) >= 0.2) {
+      var cov = 0;
+      var vr = 0;
+      for (i = 0; i < n; i++) {
+        cov += (list[i].f - mf) * (list[i].x - mx);
+        vr += (list[i].f - mf) * (list[i].f - mf);
+      }
+      var span = cov / vr;
+      a = mx - span * mf;
+      b = width - a - span;
+    } else {
+      // only one useful click so far: assume the same margin on both sides
+      var last = list[n - 1];
+      var den = 1 - 2 * last.f;
+      if (Math.abs(den) < 0.25) return false;
+      a = (last.x - last.f * width) / den;
+      b = a;
+    }
+    if (!(a >= 0)) return false;
+    if (!(b >= 0)) return false;
+    if (a > 120) return false;
+    if (b > 120) return false;
+    calStore[key] = { a: a, b: b };
+    saveCal();
+    return true;
+  }
+
+  // The video's own timeline hides its clicks from the page, but not the seek they cause.
+  // So: when the video jumps while the mouse rests on the timeline row, we know which
+  // pixel produced which time.
+  var lastTimeSeen = 0;
+  var ownSeekAt = 0;        // set whenever this script itself seeks (arrow keys)
+  var lastNoteAt = 0;
+
+  document.addEventListener('timeupdate', function (e) {
+    if (e.target instanceof HTMLVideoElement) lastTimeSeen = e.target.currentTime;
+  }, true);
+
+  document.addEventListener('seeking', function (e) {
+    var v = e.target;
+    if (!(v instanceof HTMLVideoElement)) return;
+    var t = v.currentTime;
+    var prev = lastTimeSeen;
+    lastTimeSeen = t;
+    if (!PREVIEW_ENABLED) return;
+    if (Date.now() - ownSeekAt < 400) return;       // our own arrow-key seek
+    if (v !== getVideo()) return;
+    if (!(v.duration > 0)) return;
+    if (!isFinite(v.duration)) return;
+    if (Math.abs(t - prev) < 1) return;             // not a real jump
+    var r = v.getBoundingClientRect();
+    var fromBottom = r.bottom - mouseY;
+    if (fromBottom < BAND_MIN) return;              // the mouse is not on the timeline row
+    if (fromBottom > BAND_MAX) return;
+    if (mouseX < r.left) return;
+    if (mouseX > r.right) return;
+    var f = t / v.duration;
+    if (f < 0.02) return;                           // at the very ends the player clamps
+    if (f > 0.98) return;
+
+    var ins = insetsFor(r.width);
+    var fp = (mouseX - r.left - ins.a) / (r.width - ins.a - ins.b);
+    if (fp < 0) fp = 0;
+    if (fp > 1) fp = 1;
+    var pred = fp * v.duration;
+    var off = t - pred;
+
+    var key = String(Math.round(r.width));
+    if (!calSamples[key]) calSamples[key] = [];
+    calSamples[key].push({ x: mouseX - r.left, f: f });
+    if (calSamples[key].length > 8) calSamples[key].shift();
+    var fixed = false;
+    if (Math.abs(off) > 1) fixed = refit(r.width);
+
+    if (PREVIEW_DEBUG) {
+      if (Date.now() - lastNoteAt > 1000) {
+        lastNoteAt = Date.now();
+        var msg = 'Preview ' + fmt(pred) + ' - landed ' + fmt(t);
+        if (Math.abs(off) > 1) msg = msg + (fixed ? ' - timeline adjusted' : ' - off by ' + Math.round(off) + 's');
+        toast(msg, 2500);
+      }
+    }
+  }, true);
+
   function onHover(e) {
     if (!PREVIEW_ENABLED) return;
     var v = getVideo();
@@ -445,7 +580,8 @@
     if (!ensurePreview(v)) return;
     if (pvFailed) return;
 
-    var f = (e.clientX - (r.left + SIDE_PAD)) / (r.width - 2 * SIDE_PAD);
+    var ins = insetsFor(r.width);
+    var f = (e.clientX - r.left - ins.a) / (r.width - ins.a - ins.b);
     if (f < 0) f = 0;
     if (f > 1) f = 1;
     var t = f * v.duration;
@@ -624,6 +760,7 @@
       e.stopImmediatePropagation();
       var d = e.key === 'ArrowRight' ? SEEK : -SEEK;
       var dur = v2.duration > 0 ? v2.duration : Infinity;
+      ownSeekAt = Date.now();
       v2.currentTime = Math.max(0, Math.min(dur, v2.currentTime + d));
       toast((d > 0 ? '+' : '') + d + 's');
       releaseFocus(v2);
